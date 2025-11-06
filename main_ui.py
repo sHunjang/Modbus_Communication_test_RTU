@@ -2359,7 +2359,7 @@ class Ui_MainWindow(object):
     # setupUi
 
     def retranslateUi(self, MainWindow):
-        MainWindow.setWindowTitle(QCoreApplication.translate("MainWindow", f"근로복지공단 DAQ Slave 테스트 프로그램_V3 (251105)", None))
+        MainWindow.setWindowTitle(QCoreApplication.translate("MainWindow", f"근로복지공단 DAQ Slave 테스트 프로그램_V5 (251106)", None))
         self.com_group.setTitle(QCoreApplication.translate("MainWindow", u"Com", None))
         self.baudrate_combo.setItemText(0, QCoreApplication.translate("MainWindow", u"9600", None))
         self.baudrate_combo.setItemText(1, QCoreApplication.translate("MainWindow", u"19200", None))

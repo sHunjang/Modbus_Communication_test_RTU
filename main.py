@@ -91,7 +91,7 @@ store = {
     (CONST_3P3W*16)+14: [3890, 3890, 3890, 1900, 1900, 1900, 29000, 29000, 29000, 0x0f, 0x4240, 0x0f, 0x4240, 0x0f, 0x4240],
     (CONST_3P3W*16)+15: [3890, 3890, 3890, 1900, 1900, 1900, 29000, 29000, 29000, 0x0f, 0x4240, 0x0f, 0x4240, 0x0f, 0x4240],
 
-    # ★ 3상4선 (딕셔너리 방식 - TAC4300CT 주소 매핑)
+    # 3상4선 (딕셔너리 방식 - TAC4300CT 주소 매핑)
     (CONST_3P4W*16)+0: {
         0x0024: 38000, 0x0026: 38001, 0x0028: 38002,  # 전압 L1/L2/L3
         0x0006: 10000, 0x0008: 10001, 0x000A: 10002,  # 전류 L1/L2/L3
@@ -329,7 +329,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         super().__init__()
         self.setupUi(self)
 
-        # ★ 전체 유효전력량 카운터 초기화 (일의 자리 증가용)
+        # 전체 유효전력량 카운터 초기화 (일의 자리 증가용)
         self.total_power_counter = 0
 
         # 통신 객체 초기화
@@ -532,15 +532,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def update_data(self, data):
         """
-        ★★★ Modbus 요청 분석 및 응답 생성 (32비트 Big-Endian 처리) ★★★
+        Modbus 요청 분석 및 응답 생성
         
-        3상4선 (TAC4300CT) 특수 처리:
-        - 전압/전류/유효전력/전력량: 백의 자리만 랜덤 (0~9 × 100)
-        - 전체 유효전력량 (0x0404): 매번 일의 자리 +1 증가
+        3상4선 특수 처리:
+        - 딕셔너리 기반 (주소로 접근)
+        - 백의 자리만 랜덤 (0~9 × 100)
+        - 전체 유효전력량: 매번 +1 증가
         """
         
         def get_random_value(d_type, idx):
-            """센서 타입과 인덱스에 따른 랜덤값 생성"""
+            """센서 타입별 랜덤값 생성"""
             ret = 0
             
             if d_type == CONST_1P2W:
@@ -558,10 +559,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     ret = random.randrange(0, 10)
                 elif 3 <= idx <= 5:
                     ret = random.randrange(0, 100)
-                elif 7 <= idx <= 9:
+                elif 6 <= idx <= 9:
                     ret = random.randrange(0, 1000)
             
-            # ★★★ CONST_3P4W: 백의 자리만 (0~9) × 100 ★★★
+            # ★ 3상4선: 백의 자리만 (0~9) × 100
             elif d_type == CONST_3P4W:
                 ret = random.randrange(0, 10) * 100  # 0, 100, 200, ..., 900
             
@@ -591,58 +592,56 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 device_type = device_id // 16
                 device_addr = device_id % 16
 
-                send_msg = [device_id, function_code, num_reg*2]
+                byte_count = num_reg * 2
+                send_msg = [device_id, function_code, byte_count]
 
                 store_data = store[device_id]
                 
-                # ★★★ 3상4선: 딕셔너리 (주소 기반) ★★★
+                # ★ 3상4선: 딕셔너리 (주소 기반)
                 if isinstance(store_data, dict):
-                    for i in range(0, num_reg, 2):
+                    for i in range(num_reg):
                         requested_addr = addr + i
                         
+                        # 주소로 직접 접근
                         if requested_addr in store_data:
-                            value_32bit = store_data[requested_addr]
-                            
-                            # ★★★ 전체 유효전력량 (0x0404)만 특수 처리 ★★★
-                            if requested_addr == 0x0404:
-                                # 일의 자리 +1 증가
-                                self.total_power_counter += 1
-                                value_32bit = store_data[requested_addr] + self.total_power_counter
-                                print(f"[DEBUG] 전체유효전력량 addr=0x{requested_addr:04X}, counter={self.total_power_counter}, final={value_32bit}")
-                            else:
-                                # 다른 주소: 백의 자리 랜덤값 추가
-                                random_val = get_random_value(device_type, i)
-                                value_32bit = value_32bit + random_val
-                                print(f"[DEBUG] addr=0x{requested_addr:04X}, base={store_data[requested_addr]}, random={random_val}, final={value_32bit}")
+                            base_value = store_data[requested_addr]
                         else:
-                            value_32bit = 0
+                            base_value = 0
                         
-                        # 32비트를 상위/하위 16비트로 분할
-                        high_word = (value_32bit >> 16) & 0xFFFF
-                        low_word = value_32bit & 0xFFFF
+                        # 데이터 변조
+                        if requested_addr == 0x0404:
+                            # 0x0404: 일의 자리 +1 증가
+                            self.total_power_counter += 1
+                            value = (base_value + self.total_power_counter) & 0xFFFF
+                        else:
+                            # 일반 주소: 백의 자리만 랜덤 추가
+                            random_val = get_random_value(device_type, i)
+                            value = (base_value + random_val) & 0xFFFF
                         
-                        # Big-Endian 순서: 상위부터 전송
-                        send_msg.append((high_word & 0xFF00) >> 8)
-                        send_msg.append((high_word & 0x00FF))
-                        send_msg.append((low_word & 0xFF00) >> 8)
-                        send_msg.append((low_word & 0x00FF))
+                        # 16비트 Big-Endian
+                        send_msg.append((value >> 8) & 0xFF)
+                        send_msg.append(value & 0xFF)
                 
-                # ★★★ 기타 센서: 리스트 (인덱스 기반) ★★★
+                # ★ 기타 센서: 리스트 (인덱스 기반)
                 else:
                     for i in range(0, num_reg, 2):
                         store_idx = i
                         
-                        value_32bit = store_data[store_idx] + get_random_value(device_type, store_idx)
+                        if store_idx < len(store_data):
+                            value_32bit = store_data[store_idx] + get_random_value(device_type, store_idx)
+                        else:
+                            value_32bit = 0
                         
+                        # 32비트 Big-Endian 처리
                         high_word = (value_32bit >> 16) & 0xFFFF
                         low_word = value_32bit & 0xFFFF
                         
-                        send_msg.append((high_word & 0xFF00) >> 8)
-                        send_msg.append((high_word & 0x00FF))
-                        send_msg.append((low_word & 0xFF00) >> 8)
-                        send_msg.append((low_word & 0x00FF))
+                        send_msg.append((high_word >> 8) & 0xFF)
+                        send_msg.append(high_word & 0xFF)
+                        send_msg.append((low_word >> 8) & 0xFF)
+                        send_msg.append(low_word & 0xFF)
 
-                # ===== CRC 계산 및 추가 =====
+                # ===== CRC 계산 =====
                 crc = crc16_modbus(send_msg)
                 send_msg.append((crc & 0x00FF))
                 send_msg.append((crc & 0xFF00) >> 8)
@@ -651,7 +650,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 if self.group_list[device_type][device_addr].isChecked():
                     if self.radio_list[device_type][device_addr][0].isChecked():
                         self.log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + ' OK TX: '
-                        pass
                     
                     elif self.radio_list[device_type][device_addr][1].isChecked():
                         self.log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + f'{name_list[device_type]} {device_addr}번 CRC ERROR TX: '
@@ -664,6 +662,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 self.check_and_write(send_msg)
 
             else:
+                device_type = device_id // 16
+                device_addr = device_id % 16
                 self.log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + f'{name_list[device_type]} {device_addr}번 NO CHECK TX'
                 self.log_slot(self.log_msg)
 
@@ -672,12 +672,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.log_slot(self.log_msg)
 
         except IndexError:
+            device_type = device_id // 16
+            device_addr = device_id % 16
             self.log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + f' {name_list[device_type]} {device_addr}번 Read Register out of range'
             self.log_slot(self.log_msg)
 
         except Exception as e:
             log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + " Error: " + type(e).__name__
             self.log_slot(log_msg)
+
 
     def check_and_write(self, send_msg):
         """응답 메시지를 COM 포트로 전송"""
