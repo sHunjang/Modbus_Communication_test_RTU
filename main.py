@@ -3,83 +3,65 @@
 # ============================================================================
 # 주요 수정 사항:
 # 1. 32비트 Big-Endian 데이터 처리 구현
-# 2. TAC4300CT 특수 처리 제거 (TypeError 원인)
-# 3. CONST_3P4W 랜덤값 생성 추가
-# 4. store 인덱싱 방식 변경 (주소 → 인덱스)
+# 2. 3상4선 딕셔너리 방식 (주소 기반 매핑)
+# 3. 백의 자리만 랜덤값 (0~9 × 100)
+# 4. 전체 유효전력량 일의 자리 +1 증가
 # ============================================================================
 
-import datetime    # 로그 타임스탬프 생성
-import random      # 센서 랜덤값 생성
-import sys         # 시스템 함수
-import time        # 지연 시간 설정
-import serial      # 직렬 통신
-import serial.tools.list_ports  # COM 포트 목록 조회
-
+import datetime
+import random
+import sys
+import time
+import serial
+import serial.tools.list_ports
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QTableWidgetItem)
-from main_ui import Ui_MainWindow  # Qt Designer에서 생성된 UI
-
+from main_ui import Ui_MainWindow
 
 # ============================================================================
 # 센서 타입 상수 정의
 # ============================================================================
-# 각 센서 타입에 고유 ID 할당 (Modbus 슬레이브 주소 계산용)
-# device_id = (device_type * 16) + device_addr
-# 예: CONST_3P4W=0x08, 0번 인덱스 → device_id = (0x08*16) + 0 = 0x80
+CONST_1P2W = 0x0a
+CONST_3P3W = 0x09
+CONST_3P4W = 0x08
+CONST_OIL = 0x05
+CONST_WATER = 0x04
+CONST_CO2 = 0x01
+CONST_TEMP = 0x03
+CONST_SOLAR = 0x02
+CONST_DC = 0x0b
 
-CONST_1P2W   = 0x0a  # 단상 2선식 (Single Phase 2-Wire)
-CONST_3P3W   = 0x09  # 3상 3선식 (3-Phase 3-Wire)
-CONST_3P4W   = 0x08  # 3상 4선식 (3-Phase 4-Wire)
-CONST_OIL    = 0x05  # 유량계 (Oil Flow Meter)
-CONST_WATER  = 0x04  # 수도계 (Water Meter)
-CONST_CO2    = 0x01  # CO2 센서
-CONST_TEMP   = 0x03  # 온습도 센서 (Temperature & Humidity)
-CONST_SOLAR  = 0x02  # 일사량 센서 (Solar Irradiance)
-CONST_DC     = 0x0b  # DC 모터 (DC Motor)
-
-
-# ============================================================================
-# 센서 타입별 한글 이름 매핑
-# ============================================================================
 name_list = {
-    CONST_1P2W:   "단상",
-    CONST_3P3W:   "3상3선",
-    CONST_3P4W:   "3상4선",
-    CONST_OIL:    "유량",
-    CONST_WATER:  "수도",
-    CONST_CO2:    "CO2",
-    CONST_TEMP:   "온습도",
-    CONST_SOLAR:  "일사량",
-    CONST_DC:     "DC모터",
+    CONST_1P2W: "단상",
+    CONST_3P3W: "3상3선",
+    CONST_3P4W: "3상4선",
+    CONST_OIL: "유량",
+    CONST_WATER: "수도",
+    CONST_CO2: "CO2",
+    CONST_TEMP: "온습도",
+    CONST_SOLAR: "일사량",
+    CONST_DC: "DC모터",
 }
 
-
-# ============================================================================
-# 센서별 기본값 저장 (현재는 미사용)
-# ============================================================================
 values_list = {
     CONST_1P2W: [0x08A4, 0x04D2, 0x3039, 0x0000, 0x3039],
     CONST_3P3W: [0x0ED9, 0x0EE3, 0x0EEC, 0x04D2, 0x0929, 0x000A, 0x3039, 0x5BA0, 0x03E8, 0x0000, 0x3039, 0x0000, 0x5BA0, 0x0098, 0x967F],
     CONST_3P4W: [0x0ED9, 0x0EE3, 0x0EEC, 0x04D2, 0x0929, 0x000A, 0x04D2, 0x3039, 0x5BA0, 0x03E8, 0x0000, 0x3039, 0x0000, 0x5BA0, 0x0098, 0x967F],
-    CONST_OIL:  [0x00BC, 0x614E, 0x00BC, 0x614E],
+    CONST_OIL: [0x00BC, 0x614E, 0x00BC, 0x614E],
     CONST_WATER: [0x000F, 0x423F],
-    CONST_CO2:  [0x07D0],
+    CONST_CO2: [0x07D0],
     CONST_TEMP: [0xFF85, 0x03E7],
     CONST_SOLAR: [0x4E20],
-    CONST_DC:   [0x0001],
+    CONST_DC: [0x0001],
 }
 
 CONST_LIST = [CONST_1P2W, CONST_3P3W, CONST_3P4W, CONST_OIL, CONST_WATER, CONST_CO2, CONST_TEMP, CONST_SOLAR, CONST_DC]
 
-
 # ============================================================================
 # Modbus 슬레이브 레지스터 저장소
 # ============================================================================
-# 구조: {(센서타입*16)+인덱스: [레지스터값들...]}
-# 예: (CONST_1P2W*16)+0 = 0xa0 = 160 (0번 단상 센서)
-#     값들은 기본값으로, 실제 응답시 +랜덤값으로 변환됨
-
 store = {
+    # 단상 (리스트 방식)
     (CONST_1P2W*16)+0: [2200, 1000, 20000, 0x01, 0x86a0],
     (CONST_1P2W*16)+1: [2210, 1100, 21000, 0x03, 0x0d40],
     (CONST_1P2W*16)+2: [2220, 1200, 22000, 0x04, 0x93e0],
@@ -91,6 +73,7 @@ store = {
     (CONST_1P2W*16)+8: [2280, 1800, 28000, 0x0d, 0xbba0],
     (CONST_1P2W*16)+9: [2290, 1900, 29000, 0x0f, 0x4240],
 
+    # 3상3선 (리스트 방식)
     (CONST_3P3W*16)+0: [3800, 3800, 3800, 1000, 1000, 1000, 20000, 20000, 20000, 0x01, 0x86a0, 0x01, 0x86a0, 0x01, 0x86a0],
     (CONST_3P3W*16)+1: [3810, 3810, 3810, 1100, 1100, 1100, 21000, 21000, 21000, 0x03, 0x0d40, 0x03, 0x0d40, 0x03, 0x0d40],
     (CONST_3P3W*16)+2: [3820, 3820, 3820, 1200, 1200, 1200, 22000, 22000, 22000, 0x04, 0x93e0, 0x04, 0x93e0, 0x04, 0x93e0],
@@ -108,96 +91,89 @@ store = {
     (CONST_3P3W*16)+14: [3890, 3890, 3890, 1900, 1900, 1900, 29000, 29000, 29000, 0x0f, 0x4240, 0x0f, 0x4240, 0x0f, 0x4240],
     (CONST_3P3W*16)+15: [3890, 3890, 3890, 1900, 1900, 1900, 29000, 29000, 29000, 0x0f, 0x4240, 0x0f, 0x4240, 0x0f, 0x4240],
 
-    # TAC4300CT 주소 매핑 방식으로 수정한거임.
+    # ★ 3상4선 (딕셔너리 방식 - TAC4300CT 주소 매핑)
     (CONST_3P4W*16)+0: {
-        # 전압 (L1, L2, L3)
-        0x0024: 38000,  # L1 전압
-        0x0026: 38001,  # L2 전압
-        0x0028: 38002,  # L3 전압
-        
-        # 전류 (L1, L2, L3)
-        0x0006: 10000,  # L1 전류
-        0x0008: 10001,  # L2 전류
-        0x000A: 10002,  # L3 전류
-        
-        # 유효전력 (L1, L2, L3)
-        0x000C: 20000,  # L1 유효전력
-        0x000E: 20001,  # L2 유효전력
-        0x0010: 20002,  # L3 유효전력
-        
-        # 전력량 (L1, L2, L3)
-        0x0420: 30000,  # L1 전력량
-        0x0422: 30001,  # L2 전력량
-        0x0424: 30002,  # L3 전력량
-        
-        # 전체 유효전력량
-        0x0404: 654321,
+        0x0024: 38000, 0x0026: 38001, 0x0028: 38002,  # 전압 L1/L2/L3
+        0x0006: 10000, 0x0008: 10001, 0x000A: 10002,  # 전류 L1/L2/L3
+        0x000C: 20000, 0x000E: 20001, 0x0010: 20002,  # 유효전력 L1/L2/L3
+        0x0420: 30000, 0x0422: 30001, 0x0424: 30002,  # 전력량 L1/L2/L3
+        0x0404: 654321,  # 전체 유효전력량
     },
     (CONST_3P4W*16)+1: {
         0x0024: 38010, 0x0026: 38011, 0x0028: 38012,
         0x0006: 10010, 0x0008: 10011, 0x000A: 10012,
         0x000C: 20010, 0x000E: 20011, 0x0010: 20012,
-        0x0420: 30010, 0x0422: 30011, 0x0424: 30012, 0x0404: 654321,
+        0x0420: 30010, 0x0422: 30011, 0x0424: 30012,
+        0x0404: 654321,
     },
     (CONST_3P4W*16)+2: {
         0x0024: 38020, 0x0026: 38021, 0x0028: 38022,
         0x0006: 10020, 0x0008: 10021, 0x000A: 10022,
         0x000C: 20020, 0x000E: 20021, 0x0010: 20022,
-        0x0420: 30020, 0x0422: 30021, 0x0424: 30022, 0x0404: 654321,
+        0x0420: 30020, 0x0422: 30021, 0x0424: 30022,
+        0x0404: 654321,
     },
     (CONST_3P4W*16)+3: {
         0x0024: 38030, 0x0026: 38031, 0x0028: 38032,
         0x0006: 10030, 0x0008: 10031, 0x000A: 10032,
         0x000C: 20030, 0x000E: 20031, 0x0010: 20032,
-        0x0420: 30030, 0x0422: 30031, 0x0424: 30032, 0x0404: 654321,
+        0x0420: 30030, 0x0422: 30031, 0x0424: 30032,
+        0x0404: 654321,
     },
     (CONST_3P4W*16)+4: {
         0x0024: 38040, 0x0026: 38041, 0x0028: 38042,
         0x0006: 10040, 0x0008: 10041, 0x000A: 10042,
         0x000C: 20040, 0x000E: 20041, 0x0010: 20042,
-        0x0420: 30040, 0x0422: 30041, 0x0424: 30042, 0x0404: 654321,
+        0x0420: 30040, 0x0422: 30041, 0x0424: 30042,
+        0x0404: 654321,
     },
     (CONST_3P4W*16)+5: {
         0x0024: 38050, 0x0026: 38051, 0x0028: 38052,
         0x0006: 10050, 0x0008: 10051, 0x000A: 10052,
         0x000C: 20050, 0x000E: 20051, 0x0010: 20052,
-        0x0420: 30050, 0x0422: 30051, 0x0424: 30052, 0x0404: 654321,
+        0x0420: 30050, 0x0422: 30051, 0x0424: 30052,
+        0x0404: 654321,
     },
     (CONST_3P4W*16)+6: {
         0x0024: 38060, 0x0026: 38061, 0x0028: 38062,
         0x0006: 10060, 0x0008: 10061, 0x000A: 10062,
         0x000C: 20060, 0x000E: 20061, 0x0010: 20062,
-        0x0420: 30060, 0x0422: 30061, 0x0424: 30062, 0x0404: 654321,
+        0x0420: 30060, 0x0422: 30061, 0x0424: 30062,
+        0x0404: 654321,
     },
     (CONST_3P4W*16)+7: {
         0x0024: 38070, 0x0026: 38071, 0x0028: 38072,
         0x0006: 10070, 0x0008: 10071, 0x000A: 10072,
         0x000C: 20070, 0x000E: 20071, 0x0010: 20072,
-        0x0420: 30070, 0x0422: 30071, 0x0424: 30072, 0x0404: 654321,
+        0x0420: 30070, 0x0422: 30071, 0x0424: 30072,
+        0x0404: 654321,
     },
     (CONST_3P4W*16)+8: {
         0x0024: 38080, 0x0026: 38081, 0x0028: 38082,
         0x0006: 10080, 0x0008: 10081, 0x000A: 10082,
         0x000C: 20080, 0x000E: 20081, 0x0010: 20082,
-        0x0420: 30080, 0x0422: 30081, 0x0424: 30082, 0x0404: 654321,
+        0x0420: 30080, 0x0422: 30081, 0x0424: 30082,
+        0x0404: 654321,
     },
     (CONST_3P4W*16)+9: {
         0x0024: 38090, 0x0026: 38091, 0x0028: 38092,
         0x0006: 10090, 0x0008: 10091, 0x000A: 10092,
         0x000C: 20090, 0x000E: 20091, 0x0010: 20092,
-        0x0420: 30090, 0x0422: 30091, 0x0424: 30092, 0x0404: 654321,
+        0x0420: 30090, 0x0422: 30091, 0x0424: 30092,
+        0x0404: 654321,
     },
 
-    (CONST_OIL*16)+0:  [188, 24911, 188, 24911],
-    (CONST_OIL*16)+1:  [189, 24912, 189, 24912],
-    (CONST_OIL*16)+2:  [190, 24913, 190, 24913],
-    (CONST_OIL*16)+3:  [191, 24914, 191, 24914],
-    (CONST_OIL*16)+4:  [192, 24915, 192, 24915],
-    (CONST_OIL*16)+5:  [193, 24916, 193, 24916],
-    (CONST_OIL*16)+6:  [194, 24917, 194, 24917],
-    (CONST_OIL*16)+7:  [195, 24918, 195, 24918],
-    (CONST_OIL*16)+8:  [196, 24919, 196, 24919],
-    (CONST_OIL*16)+9:  [197, 24920, 197, 24920],
+    # 나머지 센서들 (기존 방식)
+    (CONST_OIL*16)+0: [188, 24911, 188, 24911],
+    (CONST_OIL*16)+1: [189, 24912, 189, 24912],
+    (CONST_OIL*16)+2: [190, 24913, 190, 24913],
+    (CONST_OIL*16)+3: [191, 24914, 191, 24914],
+    (CONST_OIL*16)+4: [192, 24915, 192, 24915],
+    (CONST_OIL*16)+5: [193, 24916, 193, 24916],
+    (CONST_OIL*16)+6: [194, 24917, 194, 24917],
+    (CONST_OIL*16)+7: [195, 24918, 195, 24918],
+    (CONST_OIL*16)+8: [196, 24919, 196, 24919],
+    (CONST_OIL*16)+9: [197, 24920, 197, 24920],
 
     (CONST_WATER*16)+0: [0, 16960],
     (CONST_WATER*16)+1: [1, 16961],
@@ -260,30 +236,16 @@ store = {
 # CRC16 Modbus 계산 함수
 # ============================================================================
 def crc16_modbus(data: bytes) -> int:
-    """
-    Modbus RTU CRC16 계산
-    - 초기값: 0xFFFF
-    - 각 바이트마다 XOR 연산 후 8비트 시프트
-    - 최하위 비트가 1이면 0xA001로 XOR
-    
-    Args:
-        data: CRC를 계산할 바이트 배열
-    
-    Returns:
-        16비트 CRC 값 (Little-Endian)
-    """
-    crc = 0xFFFF  # CRC 초기값
-    
+    """Modbus RTU CRC16 계산"""
+    crc = 0xFFFF
     for pos in data:
-        crc ^= pos  # 현재 바이트와 XOR
-        
-        for _ in range(8):  # 8비트씩 처리
-            if (crc & 1) != 0:  # 최하위 비트 확인
+        crc ^= pos
+        for _ in range(8):
+            if (crc & 1) != 0:
                 crc >>= 1
-                crc ^= 0xA001  # Modbus 다항식
+                crc ^= 0xA001
             else:
                 crc >>= 1
-    
     return crc
 
 
@@ -291,32 +253,23 @@ def crc16_modbus(data: bytes) -> int:
 # 직렬 통신 수신 스레드
 # ============================================================================
 class com_thread(QThread):
-    """
-    QThread를 상속받아 별도 스레드에서 COM 포트 수신
-    - Signal: received_msg (수신 데이터), log (로그 메시지)
-    """
-    received_msg = Signal(bytes)  # 수신 메시지 신호
-    log = Signal(str)              # 로그 메시지 신호
+    """QThread를 상속받아 별도 스레드에서 COM 포트 수신"""
+    received_msg = Signal(bytes)
+    log = Signal(str)
 
     def __init__(self):
         super().__init__()
-        self.ser = serial.Serial()  # 직렬 포트 객체
-        self.msg = bytes()           # 수신 메시지 버퍼
+        self.ser = serial.Serial()
+        self.msg = bytes()
 
     def run(self):
-        """
-        무한 루프에서 8바이트씩 수신
-        - Modbus RTU 메시지: 6바이트 + 2바이트 CRC = 8바이트
-        """
+        """무한 루프에서 8바이트씩 수신"""
         while True:
             try:
-                self.msg = self.ser.read(8)  # 8바이트 읽기
-                
+                self.msg = self.ser.read(8)
                 if len(self.msg) < 1:
                     continue
-                
-                self.received_msg.emit(self.msg)  # 신호 발신
-                
+                self.received_msg.emit(self.msg)
             except Exception as e:
                 self.msg = []
 
@@ -325,26 +278,19 @@ class com_thread(QThread):
 # 직렬 통신 핸들러 클래스
 # ============================================================================
 class serial_handler(QObject):
-    """
-    QObject 기반 직렬 통신 관리
-    - 포트 목록 조회
-    - 포트 열기/닫기
-    - 로그 신호 발신
-    """
-    log = Signal(str)  # 로그 신호
+    """QObject 기반 직렬 통신 관리"""
+    log = Signal(str)
 
     def __init__(self):
         super().__init__()
-        self.ser = None  # 직렬 포트 객체
+        self.ser = None
 
     def get_port_list(self):
         """시스템에서 사용 가능한 COM 포트 목록 반환"""
         ports = serial.tools.list_ports.comports()
         available_ports = []
-        
         for p in ports:
             available_ports.append(p.device)
-        
         available_ports.sort()
         return available_ports
 
@@ -355,7 +301,6 @@ class serial_handler(QObject):
             log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + ' COM PORT OPEN'
             self.log.emit(log_msg)
             return self.ser
-            
         except Exception as e:
             log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + ' COM PORT OPEN FAIL'
             self.log.emit(log_msg)
@@ -367,7 +312,6 @@ class serial_handler(QObject):
             self.ser.close()
             log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + ' COM PORT CLOSE'
             self.log.emit(log_msg)
-            
         except Exception as e:
             log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + ' COM PORT CLOSE FAIL'
             self.log.emit(log_msg)
@@ -378,86 +322,79 @@ class serial_handler(QObject):
 # 메인 윈도우 클래스
 # ============================================================================
 class MainWindow(QMainWindow, Ui_MainWindow):
-    """
-    Modbus RTU 슬레이브 시뮬레이터 메인 윈도우
-    - UI 구성 및 이벤트 처리
-    - Modbus 요청/응답 처리
-    - 오류 주입 테스트 기능
-    """
+    """Modbus RTU 슬레이브 시뮬레이터 메인 윈도우"""
 
     def __init__(self):
         """윈도우 초기화"""
         super().__init__()
-        self.setupUi(self)  # main_ui.py에서 생성된 UI 로드
+        self.setupUi(self)
 
-        # ===== 통신 객체 초기화 =====
-        self.comm_handler = serial_handler()  # COM 포트 핸들러
-        self.worker = com_thread()            # 수신 스레드
-        
-        # ===== 신호-슬롯 연결 =====
+        # ★ 전체 유효전력량 카운터 초기화 (일의 자리 증가용)
+        self.total_power_counter = 0
+
+        # 통신 객체 초기화
+        self.comm_handler = serial_handler()
+        self.worker = com_thread()
+
+        # 신호-슬롯 연결
         self.worker.received_msg.connect(self.received_msg_slot)
         self.comm_handler.log.connect(self.log_slot)
         self.worker.log.connect(self.log_slot)
 
-        # ===== COM 포트 콤보박스 설정 =====
+        # COM 포트 콤보박스 설정
         self.com_combo.addItems(self.comm_handler.get_port_list())
-
-        # 현재 보드레이트 콤보박스에서 "9600"을 찾아 기본 선택
         default_baudrate_index = self.baudrate_combo.findText("9600")
-        if default_baudrate_index >= 0:  # "9600"이 존재하면
+        if default_baudrate_index >= 0:
             self.baudrate_combo.setCurrentIndex(default_baudrate_index)
         else:
-            # "9600"이 없으면 첫 번째 항목 선택
             self.baudrate_combo.setCurrentIndex(0)
 
-        # ===== 버튼 이벤트 연결 =====
+        # 버튼 이벤트 연결
         self.com_open_btn.clicked.connect(self.com_open_slot)
         self.com_close_btn.clicked.connect(self.com_close_slot)
-        
-        # Log 텍스트 내용 삭제 버튼
         self.log_clear_btn.clicked.connect(self.log_clear_slot)
 
-        # ===== 센서별 그룹박스 매핑 (UI 컨트롤 참조) =====
-        self.group_list = { 
+        # 센서별 그룹박스 매핑
+        self.group_list = {
             CONST_1P2W: [self.tag1p2w_0_group, self.tag1p2w_1_group, self.tag1p2w_2_group,
-                        self.tag1p2w_3_group, self.tag1p2w_4_group, self.tag1p2w_5_group,
-                        self.tag1p2w_6_group, self.tag1p2w_7_group, self.tag1p2w_8_group,
-                        self.tag1p2w_9_group],
+                         self.tag1p2w_3_group, self.tag1p2w_4_group, self.tag1p2w_5_group,
+                         self.tag1p2w_6_group, self.tag1p2w_7_group, self.tag1p2w_8_group,
+                         self.tag1p2w_9_group],
             CONST_3P3W: [self.tag3p3w_0_group, self.tag3p3w_1_group, self.tag3p3w_2_group,
-                        self.tag3p3w_3_group, self.tag3p3w_4_group, self.tag3p3w_5_group,
-                        self.tag3p3w_6_group, self.tag3p3w_7_group, self.tag3p3w_8_group,
-                        self.tag3p3w_9_group, self.tag3p3w_9_group, self.tag3p3w_9_group,
-                        self.tag3p3w_9_group, self.tag3p3w_9_group, self.tag3p3w_9_group,
-                        self.tag3p3w_9_group],
+                         self.tag3p3w_3_group, self.tag3p3w_4_group, self.tag3p3w_5_group,
+                         self.tag3p3w_6_group, self.tag3p3w_7_group, self.tag3p3w_8_group,
+                         self.tag3p3w_9_group, self.tag3p3w_9_group, self.tag3p3w_9_group,
+                         self.tag3p3w_9_group, self.tag3p3w_9_group, self.tag3p3w_9_group,
+                         self.tag3p3w_9_group],
             CONST_3P4W: [self.tag3p4w_0_group, self.tag3p4w_1_group, self.tag3p4w_2_group,
-                        self.tag3p4w_3_group, self.tag3p4w_4_group, self.tag3p4w_5_group,
-                        self.tag3p4w_6_group, self.tag3p4w_7_group, self.tag3p4w_8_group,
-                        self.tag3p4w_9_group],
+                         self.tag3p4w_3_group, self.tag3p4w_4_group, self.tag3p4w_5_group,
+                         self.tag3p4w_6_group, self.tag3p4w_7_group, self.tag3p4w_8_group,
+                         self.tag3p4w_9_group],
             CONST_OIL: [self.oil_0_group, self.oil_1_group, self.oil_2_group, self.oil_3_group,
-                       self.oil_4_group, self.oil_5_group, self.oil_6_group, self.oil_7_group,
-                       self.oil_8_group, self.oil_9_group],
+                        self.oil_4_group, self.oil_5_group, self.oil_6_group, self.oil_7_group,
+                        self.oil_8_group, self.oil_9_group],
             CONST_WATER: [self.water_0_group, self.water_1_group, self.water_2_group,
-                         self.water_3_group, self.water_4_group, self.water_5_group,
-                         self.water_6_group, self.water_7_group, self.water_8_group,
-                         self.water_9_group],
+                          self.water_3_group, self.water_4_group, self.water_5_group,
+                          self.water_6_group, self.water_7_group, self.water_8_group,
+                          self.water_9_group],
             CONST_CO2: [self.co2_0_group, self.co2_1_group, self.co2_2_group, self.co2_3_group,
-                       self.co2_4_group, self.co2_5_group, self.co2_6_group, self.co2_7_group,
-                       self.co2_8_group, self.co2_9_group],
+                        self.co2_4_group, self.co2_5_group, self.co2_6_group, self.co2_7_group,
+                        self.co2_8_group, self.co2_9_group],
             CONST_TEMP: [self.co2_0_group_2, self.co2_1_group_2, self.co2_2_group_2,
-                        self.co2_3_group_2, self.co2_4_group_2, self.co2_5_group_2,
-                        self.co2_6_group_2, self.co2_7_group_2, self.co2_8_group_2,
-                        self.co2_9_group_2],
+                         self.co2_3_group_2, self.co2_4_group_2, self.co2_5_group_2,
+                         self.co2_6_group_2, self.co2_7_group_2, self.co2_8_group_2,
+                         self.co2_9_group_2],
             CONST_SOLAR: [self.co2_0_group_3, self.co2_1_group_3, self.co2_2_group_3,
-                         self.co2_3_group_3, self.co2_4_group_3, self.co2_5_group_3,
-                         self.co2_6_group_3, self.co2_7_group_3, self.co2_8_group_3,
-                         self.co2_9_group_3],
+                          self.co2_3_group_3, self.co2_4_group_3, self.co2_5_group_3,
+                          self.co2_6_group_3, self.co2_7_group_3, self.co2_8_group_3,
+                          self.co2_9_group_3],
             CONST_DC: [self.co2_0_group_4, self.co2_1_group_4, self.co2_2_group_4,
-                      self.co2_3_group_4, self.co2_4_group_4, self.co2_5_group_4,
-                      self.co2_6_group_4, self.co2_7_group_4, self.co2_8_group_4,
-                      self.co2_9_group_4],
+                       self.co2_3_group_4, self.co2_4_group_4, self.co2_5_group_4,
+                       self.co2_6_group_4, self.co2_7_group_4, self.co2_8_group_4,
+                       self.co2_9_group_4],
         }
 
-        # ===== 센서별 라디오버튼 매핑 (정상/CRC오류/타이밍오류) =====
+        # 센서별 라디오버튼 매핑
         self.radio_list = {
             CONST_1P2W: [
                 [self.tag1p2w_0_normal_radio, self.tag1p2w_0_crc_radio, self.tag1p2w_0_timing_radio],
@@ -575,39 +512,32 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             ],
         }
 
-        self.show()  # 윈도우 표시
+        self.show()
 
     @Slot(bytes)
     def received_msg_slot(self, msg):
-        """
-        COM 포트로부터 수신한 메시지 처리
-        
-        Args:
-            msg: 수신한 바이트 배열 (8바이트)
-        
-        처리 과정:
-        1. CRC 검증
-        2. 정상이면 update_data() 호출 (응답 생성)
-        3. CRC 오류면 로그만 기록하고 응답 생략
-        """
+        """COM 포트로부터 수신한 메시지 처리"""
         try:
-            data = msg[:-2]  # 데이터 (CRC 제외)
-            crc = int.from_bytes(msg[-2:], byteorder='little')  # CRC 추출 (Little-Endian)
-
-            if crc == crc16_modbus(data):  # CRC 검증
+            data = msg[:-2]
+            crc = int.from_bytes(msg[-2:], byteorder='little')
+            if crc == crc16_modbus(data):
                 log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + ' OK RX: ' + ' '.join([f'{i:02x}' for i in msg])
                 self.log_slot(log_msg)
-                self.update_data(data)  # 응답 데이터 생성
+                self.update_data(data)
             else:
-                # CRC 오류: 응답 생략 (실제 Modbus 동작)
                 log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + ' Fail RX: ' + ' '.join([f'{i:02x}' for i in msg])
                 self.log_slot(log_msg)
-
         except Exception as e:
             print('received_msg_slot', type(e).__name__, e)
 
     def update_data(self, data):
-        """Modbus 요청 분석 및 응답 생성 (32비트 Big-Endian 처리)"""
+        """
+        ★★★ Modbus 요청 분석 및 응답 생성 (32비트 Big-Endian 처리) ★★★
+        
+        3상4선 (TAC4300CT) 특수 처리:
+        - 전압/전류/유효전력/전력량: 백의 자리만 랜덤 (0~9 × 100)
+        - 전체 유효전력량 (0x0404): 매번 일의 자리 +1 증가
+        """
         
         def get_random_value(d_type, idx):
             """센서 타입과 인덱스에 따른 랜덤값 생성"""
@@ -631,7 +561,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 elif 7 <= idx <= 9:
                     ret = random.randrange(0, 1000)
             
-            # CONST_3P4W는 랜덤값 없음
+            # ★★★ CONST_3P4W: 백의 자리만 (0~9) × 100 ★★★
+            elif d_type == CONST_3P4W:
+                ret = random.randrange(0, 10) * 100  # 0, 100, 200, ..., 900
             
             elif d_type == CONST_OIL:
                 ret = random.randrange(0, 1000)
@@ -661,44 +593,42 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                 send_msg = [device_id, function_code, num_reg*2]
 
-                # store 데이터 가져오기
                 store_data = store[device_id]
                 
-                # 디버깅: 타입 확인
-                # print(f"[DEBUG] device_id={device_id}, type={type(store_data)}, addr={addr:04X}")
-                
-                # 3상4선: 딕셔너리 (주소 기반, 고정값)
+                # ★★★ 3상4선: 딕셔너리 (주소 기반) ★★★
                 if isinstance(store_data, dict):
-                    # print(f"[DEBUG] 딕셔너리 처리 시작")
-                    
                     for i in range(0, num_reg, 2):
                         requested_addr = addr + i
                         
-                        # print(f"[DEBUG] 요청 주소: {requested_addr:04X}")
-                        
                         if requested_addr in store_data:
                             value_32bit = store_data[requested_addr]
-                            # print(f"[DEBUG] 값 찾음: {value_32bit}")
+                            
+                            # ★★★ 전체 유효전력량 (0x0404)만 특수 처리 ★★★
+                            if requested_addr == 0x0404:
+                                # 일의 자리 +1 증가
+                                self.total_power_counter += 1
+                                value_32bit = store_data[requested_addr] + self.total_power_counter
+                                print(f"[DEBUG] 전체유효전력량 addr=0x{requested_addr:04X}, counter={self.total_power_counter}, final={value_32bit}")
+                            else:
+                                # 다른 주소: 백의 자리 랜덤값 추가
+                                random_val = get_random_value(device_type, i)
+                                value_32bit = value_32bit + random_val
+                                print(f"[DEBUG] addr=0x{requested_addr:04X}, base={store_data[requested_addr]}, random={random_val}, final={value_32bit}")
                         else:
                             value_32bit = 0
-                            # print(f"[DEBUG] 매핑 없음, 0 반환")
                         
-                        # 랜덤값 추가 안 함!
-                        
+                        # 32비트를 상위/하위 16비트로 분할
                         high_word = (value_32bit >> 16) & 0xFFFF
                         low_word = value_32bit & 0xFFFF
                         
-                        # print(f"[DEBUG] 32비트 분할: high={high_word:04X}, low={low_word:04X}")
-                        
+                        # Big-Endian 순서: 상위부터 전송
                         send_msg.append((high_word & 0xFF00) >> 8)
                         send_msg.append((high_word & 0x00FF))
                         send_msg.append((low_word & 0xFF00) >> 8)
                         send_msg.append((low_word & 0x00FF))
                 
-                # 기타 센서: 리스트 (인덱스 기반, 랜덤값)
+                # ★★★ 기타 센서: 리스트 (인덱스 기반) ★★★
                 else:
-                    # print(f"[DEBUG] 리스트 처리 시작")
-                    
                     for i in range(0, num_reg, 2):
                         store_idx = i
                         
@@ -737,34 +667,24 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 self.log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + f'{name_list[device_type]} {device_addr}번 NO CHECK TX'
                 self.log_slot(self.log_msg)
 
-        except KeyError as e:
-            self.log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + f' ID out of range : {device_id:02X}'
+        except KeyError:
+            self.log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + ' ID out of range : ' + f'{device_id:02X}'
             self.log_slot(self.log_msg)
-            print(f"[DEBUG] KeyError: {e}")
 
-        except IndexError as e:
+        except IndexError:
             self.log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + f' {name_list[device_type]} {device_addr}번 Read Register out of range'
             self.log_slot(self.log_msg)
-            print(f"[DEBUG] IndexError: {e}")
 
         except Exception as e:
-            log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + f" Error: {type(e).__name__}"
+            log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + " Error: " + type(e).__name__
             self.log_slot(log_msg)
-            print(f"[DEBUG] Exception: {type(e).__name__}, {e}")
-
 
     def check_and_write(self, send_msg):
-        """
-        응답 메시지를 COM 포트로 전송
-        
-        Args:
-            send_msg: 전송할 바이트 배열 (리스트)
-        """
+        """응답 메시지를 COM 포트로 전송"""
         try:
-            self.worker.ser.write(send_msg)  # 직렬 포트로 전송
-            self.log_msg += ' '.join([f'{i:02x}' for i in send_msg])  # 로그에 추가
+            self.worker.ser.write(send_msg)
+            self.log_msg += ' '.join([f'{i:02x}' for i in send_msg])
             self.log_slot(self.log_msg)
-
         except Exception as e:
             log_msg = datetime.datetime.now().strftime("[%H:%M:%S]") + "Error: " + str(e)
             self.log_slot(log_msg)
@@ -773,13 +693,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """COM 포트 열기 및 수신 스레드 시작"""
         try:
             self.worker.ser = self.comm_handler.open(
-                self.com_combo.currentText(), 
+                self.com_combo.currentText(),
                 int(self.baudrate_combo.currentText())
             )
-            self.com_open_btn.setEnabled(False)   # 열기 버튼 비활성화
-            self.com_close_btn.setEnabled(True)   # 닫기 버튼 활성화
-            self.worker.start()  # 수신 스레드 시작
-
+            self.com_open_btn.setEnabled(False)
+            self.com_close_btn.setEnabled(True)
+            self.worker.start()
         except Exception as e:
             print(e)
 
@@ -787,33 +706,26 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """COM 포트 닫기"""
         try:
             self.comm_handler.close()
-            self.com_open_btn.setEnabled(True)    # 열기 버튼 활성화
-            self.com_close_btn.setEnabled(False)  # 닫기 버튼 비활성화
-
+            self.com_open_btn.setEnabled(True)
+            self.com_close_btn.setEnabled(False)
         except Exception as e:
             print(e)
 
     @Slot(str)
     def log_slot(self, log_msg):
-        """
-        로그 메시지를 UI 텍스트 에디터에 출력
-        
-        Args:
-            log_msg: 출력할 로그 메시지 (타임스탬프 포함)
-        """
+        """로그 메시지를 UI 텍스트 에디터에 출력"""
         self.log_text_edit.appendPlainText(log_msg)
-        
-    # Log 삭제 버튼 메서트
-    @ Slot()
+
+    @Slot()
     def log_clear_slot(self):
         """Log 텍스트 내용 삭제"""
-        
         try:
             self.log_text_edit.clear()
             log_msg = datetime.datetime.now().strftime("[%H:%M:%S]")
             self.log_text_edit.appendPlainText(log_msg)
         except Exception as e:
             print(f" Log 삭제 실패: {e} ")
+
 
 # ============================================================================
 # 메인 실행
